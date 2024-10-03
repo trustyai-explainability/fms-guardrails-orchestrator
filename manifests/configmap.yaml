@@ -1,0 +1,28 @@
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: fms-orchestr8-config-nlp
+  labels:
+    app: fmstack-nlp
+    component: fms-orchestr8-nlp
+    deploy-name: fms-orchestr8-nlp
+data:
+  config.yaml: |
+    generation:
+      provider: tgis
+      service:
+          hostname: caikit-tgis-isvc-grpc-predictor-guardrails-orchestrator.apps.rosa.chrxu.8vf2.p3.openshiftapps.com
+          port: 443
+          # tls: caikit
+    detectors:
+      regex:
+        service:
+          hostname:  https://regex-detector-guardrails-orchestrator.apps.rosa.chrxu.8vf2.p3.openshiftapps.com/api/v1/text/contents
+          port: 443
+        chunker_id: whole_doc_chunker
+        default_threshold: 0.5
+      # tls:
+      # caikit:
+      #   cert_path: /tls/server/tls.crt
+      #   key_path: /tls/server/tls.key
+      #   client_ca_cert_path: /tls/server/ca.crt
