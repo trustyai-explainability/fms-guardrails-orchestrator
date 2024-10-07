@@ -1,0 +1,23 @@
+kind: Service
+apiVersion: v1
+metadata:
+  name: fms-orchestr8-nlp
+  labels:
+    app: fmstack-nlp
+    component: fms-orchestr8-nlp
+spec:
+  ipFamilies:
+    - IPv4
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8033
+      targetPort: 8033
+  internalTrafficPolicy: Cluster
+  type: ClusterIP
+  ipFamilyPolicy: SingleStack
+  sessionAffinity: None
+  selector:
+    app: fmstack-nlp
+    component: fms-orchestr8-nlp
+    deploy-name: fms-orchestr8-nlp
