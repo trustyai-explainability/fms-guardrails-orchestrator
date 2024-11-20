@@ -22,9 +22,28 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    clients::detector::{ContentAnalysisResponse, ContextType},
+    clients::{
+        self,
+        detector::{ContentAnalysisResponse, ContextType},
+        openai::{Content, ContentType},
+    },
+    health::HealthCheckCache,
     pb,
 };
+
+pub const THRESHOLD_PARAM: &str = "threshold";
+
+#[derive(Clone, Debug, Serialize)]
+pub struct InfoResponse {
+    pub services: HealthCheckCache,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct InfoParams {
+    /// Whether to probe the client services' health checks or just return the latest health status.
+    #[serde(default)]
+    pub probe: bool,
+}
 
 /// Parameters relevant to each detector
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -37,8 +56,8 @@ impl DetectorParams {
     }
 
     /// Threshold to filter detector results by score.
-    pub fn threshold(&self) -> Option<f64> {
-        self.0.get("threshold").and_then(|v| v.as_f64())
+    pub fn pop_threshold(&mut self) -> Option<f64> {
+        self.0.remove(THRESHOLD_PARAM).and_then(|v| v.as_f64())
     }
 }
 
@@ -928,6 +947,79 @@ pub struct ContextDocsResult {
 
 /// The request format expected in the /api/v2/text/detect/generated endpoint.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChatDetectionHttpRequest {
+    /// The map of detectors to be used, along with their respective parameters, e.g. thresholds.
+    pub detectors: HashMap<String, DetectorParams>,
+
+    // The list of messages to run detections on.
+    pub messages: Vec<clients::openai::Message>,
+}
+
+impl ChatDetectionHttpRequest {
+    /// Upfront validation of user request
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        // Validate required parameters
+        if self.detectors.is_empty() {
+            return Err(ValidationError::Required("detectors".into()));
+        }
+        if self.messages.is_empty() {
+            return Err(ValidationError::Required("messages".into()));
+        }
+
+        Ok(())
+    }
+
+    /// Validates for the "/api/v1/text/chat" endpoint.
+    pub fn validate_for_text(&self) -> Result<(), ValidationError> {
+        self.validate()?;
+        self.validate_messages()?;
+        validate_detector_params(&self.detectors)?;
+
+        Ok(())
+    }
+
+    /// Validates if message contents are either a string or a content type of type "text"
+    fn validate_messages(&self) -> Result<(), ValidationError> {
+        for message in &self.messages {
+            match &message.content {
+                Some(content) => self.validate_content_type(content)?,
+                None => {
+                    return Err(ValidationError::Invalid(
+                        "Message content cannot be empty".into(),
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates if content type array contains only text messages
+    fn validate_content_type(&self, content: &Content) -> Result<(), ValidationError> {
+        match content {
+            Content::Array(content) => {
+                for content_part in content {
+                    if !matches!(content_part.r#type, ContentType::Text) {
+                        return Err(ValidationError::Invalid(
+                            "Only content of type text is allowed".into(),
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            Content::Text(_) => Ok(()), // if message.content is a string, it is a valid message
+        }
+    }
+}
+
+/// The response format of the /api/v2/text/detection/chat endpoint
+#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatDetectionResult {
+    /// Detection results
+    pub detections: Vec<DetectionResult>,
+}
+
+/// The request format expected in the /api/v2/text/detect/generated endpoint.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DetectionOnGeneratedHttpRequest {
     /// The prompt to be sent to the LLM.
     pub prompt: String,
@@ -1182,10 +1274,12 @@ mod tests {
         {
             "threshold": 0.2
         }"#;
-        let value: DetectorParams = serde_json::from_str(value_json)?;
-        assert_eq!(value.threshold(), Some(0.2));
-        let value = DetectorParams::new();
-        assert_eq!(value.threshold(), None);
+        let mut value: DetectorParams = serde_json::from_str(value_json)?;
+        assert_eq!(value.pop_threshold(), Some(0.2));
+        assert!(!value.contains_key("threshold"));
+        let mut value = DetectorParams::new();
+        assert!(!value.contains_key("threshold"));
+        assert_eq!(value.pop_threshold(), None);
         Ok(())
     }
 }

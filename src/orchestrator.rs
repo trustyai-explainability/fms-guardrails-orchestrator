@@ -17,27 +17,34 @@
 
 pub mod errors;
 pub use errors::Error;
+pub mod chat_completions_detection;
 pub mod streaming;
 pub mod unary;
 
 use std::{collections::HashMap, sync::Arc};
 
 use axum::http::header::HeaderMap;
+use opentelemetry::trace::TraceId;
 use tokio::{sync::RwLock, time::Instant};
 use tracing::{debug, info};
-use uuid::Uuid;
 
 use crate::{
     clients::{
-        self, detector::ContextType, ChunkerClient, DetectorClient, GenerationClient, NlpClient,
-        TgisClient, COMMON_ROUTER_KEY,
+        self,
+        chunker::ChunkerClient,
+        detector::{
+            text_context_doc::ContextType, TextChatDetectorClient, TextContextDocDetectorClient,
+            TextGenerationDetectorClient,
+        },
+        openai::{ChatCompletionsRequest, OpenAiClient},
+        ClientMap, GenerationClient, NlpClient, TextContentsDetectorClient, TgisClient, NlpHttpClient
     },
-    config::{GenerationProvider, OrchestratorConfig},
-    health::{HealthCheckCache, HealthProbe, HealthProbeResponse},
+    config::{DetectorType, GenerationProvider, OrchestratorConfig},
+    health::HealthCheckCache,
     models::{
-        ContextDocsHttpRequest, DetectionOnGeneratedHttpRequest, DetectorParams,
-        GenerationWithDetectionHttpRequest, GuardrailsConfig, GuardrailsHttpRequest,
-        GuardrailsTextGenerationParameters, TextContentDetectionHttpRequest,
+        ChatDetectionHttpRequest, ContextDocsHttpRequest, DetectionOnGeneratedHttpRequest,
+        DetectorParams, GenerationWithDetectionHttpRequest, GuardrailsConfig,
+        GuardrailsHttpRequest, GuardrailsTextGenerationParameters, TextContentDetectionHttpRequest,
     },
 };
 
@@ -48,16 +55,20 @@ const UNSUITABLE_INPUT_MESSAGE: &str = "Unsuitable input detected. \
 #[cfg_attr(test, derive(Default))]
 pub struct Context {
     config: OrchestratorConfig,
-    generation_client: GenerationClient,
-    chunker_client: ChunkerClient,
-    detector_client: DetectorClient,
+    clients: ClientMap,
+}
+
+impl Context {
+    pub fn new(config: OrchestratorConfig, clients: ClientMap) -> Self {
+        Self { config, clients }
+    }
 }
 
 /// Handles orchestrator tasks.
 #[cfg_attr(test, derive(Default))]
 pub struct Orchestrator {
     ctx: Arc<Context>,
-    client_health_cache: Arc<RwLock<HealthCheckCache>>,
+    client_health: Arc<RwLock<HealthCheckCache>>,
 }
 
 impl Orchestrator {
@@ -65,16 +76,11 @@ impl Orchestrator {
         config: OrchestratorConfig,
         start_up_health_check: bool,
     ) -> Result<Self, Error> {
-        let (generation_client, chunker_client, detector_client) = create_clients(&config).await;
-        let ctx = Arc::new(Context {
-            config,
-            generation_client,
-            chunker_client,
-            detector_client,
-        });
+        let clients = create_clients(&config).await;
+        let ctx = Arc::new(Context { config, clients });
         let orchestrator = Self {
             ctx,
-            client_health_cache: Arc::new(RwLock::new(HealthCheckCache::default())),
+            client_health: Arc::new(RwLock::new(HealthCheckCache::default())),
         };
         debug!("running start up checks");
         orchestrator.on_start_up(start_up_health_check).await?;
@@ -92,37 +98,34 @@ impl Orchestrator {
     pub async fn on_start_up(&self, health_check: bool) -> Result<(), Error> {
         info!("Performing start-up actions for orchestrator...");
         if health_check {
-            info!("Probing health status of configured clients...");
-            // Run probe, update cache
-            let res = self.clients_health(true).await.unwrap_or_else(|e| {
-                // Panic for unexpected behaviour as there are currently no errors propagated to here.
-                panic!("Unexpected error during client health probing: {}", e);
-            });
+            info!("Probing client health...");
+            let client_health = self.client_health(true).await;
             // Results of probe do not affect orchestrator start-up.
-            info!("Orchestrator client health probe results:\n{}", res);
+            info!("Client health:\n{client_health}");
         }
         Ok(())
     }
 
-    pub async fn clients_health(&self, probe: bool) -> Result<HealthProbeResponse, Error> {
-        let initialized = self.client_health_cache.read().await.is_initialized();
+    /// Returns client health state.
+    pub async fn client_health(&self, probe: bool) -> HealthCheckCache {
+        let initialized = !self.client_health.read().await.is_empty();
         if probe || !initialized {
             debug!("refreshing health cache");
             let now = Instant::now();
-            let detectors = self.ctx.detector_client.health().await?;
-            let chunkers = self.ctx.chunker_client.health().await?;
-            let generation = self.ctx.generation_client.health().await?;
-            let mut health_cache = self.client_health_cache.write().await;
-            health_cache.detectors = detectors;
-            health_cache.chunkers = chunkers;
-            health_cache.generation = generation;
+            let mut health = HealthCheckCache::with_capacity(self.ctx.clients.len());
+            // TODO: perform health checks concurrently?
+            for (key, client) in self.ctx.clients.iter() {
+                let result = client.health().await;
+                health.insert(key.into(), result);
+            }
+            let mut client_health = self.client_health.write().await;
+            *client_health = health;
             debug!(
                 "refreshing health cache completed in {:.2?}ms",
                 now.elapsed().as_millis()
             );
         }
-
-        Ok(HealthProbeResponse::from_cache(self.client_health_cache.clone()).await)
+        self.client_health.read().await.clone()
     }
 }
 
@@ -162,50 +165,94 @@ fn get_chunker_ids(
         .collect::<Result<Vec<_>, Error>>()
 }
 
-async fn create_clients(
-    config: &OrchestratorConfig,
-) -> (GenerationClient, ChunkerClient, DetectorClient) {
-    // TODO: create better solution for routers
-    let generation_client = match &config.generation {
-        Some(generation) => match &generation.provider {
+async fn create_clients(config: &OrchestratorConfig) -> ClientMap {
+    let mut clients = ClientMap::new();
+
+    // Create generation client
+    if let Some(generation) = &config.generation {
+        match generation.provider {
             GenerationProvider::Tgis => {
-                let client = TgisClient::new(
-                    clients::DEFAULT_TGIS_PORT,
-                    &[(COMMON_ROUTER_KEY.to_string(), generation.service.clone())],
-                )
-                .await;
-                GenerationClient::tgis(client)
+                let tgis_client = TgisClient::new(&generation.service).await;
+                let generation_client = GenerationClient::tgis(tgis_client);
+                clients.insert("generation".to_string(), generation_client);
             }
             GenerationProvider::Nlp => {
-                let client = NlpClient::new(
-                    clients::DEFAULT_CAIKIT_NLP_PORT,
-                    &[(COMMON_ROUTER_KEY.to_string(), generation.service.clone())],
-                )
-                .await;
-                GenerationClient::nlp(client)
+                let nlp_client = NlpClient::new(&generation.service).await;
+                let generation_client = GenerationClient::nlp(nlp_client);
+                clients.insert("generation".to_string(), generation_client);
             }
-        },
-        None => GenerationClient::not_configured(),
-    };
-    // TODO: simplify all of this
-    let chunker_config = match &config.chunkers {
-        Some(chunkers) => chunkers
-            .iter()
-            .map(|(chunker_id, config)| (chunker_id.clone(), config.service.clone()))
-            .collect::<Vec<_>>(),
-        None => vec![],
-    };
-    let chunker_client = ChunkerClient::new(clients::DEFAULT_CHUNKER_PORT, &chunker_config).await;
+            GenerationProvider::NlpClientHttp => {
+                let nlp_client_http = NlpClientHttp::new(&generation.service).await;
+                let generation_client = GenerationClient::nlp_http(nlp_client_http);
+                clients.insert("generation".to_string(), generation_client);
+            }
+        }
+    }
 
-    let detector_config = config
-        .detectors
-        .iter()
-        .map(|(detector_id, config)| (detector_id.clone(), config.service.clone()))
-        .collect::<Vec<_>>();
-    let detector_client =
-        DetectorClient::new(clients::DEFAULT_DETECTOR_PORT, &detector_config).await;
+    // Create chat generation client
+    if let Some(chat_generation) = &config.chat_generation {
+        let openai_client = OpenAiClient::new(
+            &chat_generation.service,
+            chat_generation.health_service.as_ref(),
+        )
+        .await;
+        clients.insert("chat_generation".to_string(), openai_client);
+    }
 
-    (generation_client, chunker_client, detector_client)
+    // Create chunker clients
+    if let Some(chunkers) = &config.chunkers {
+        for (chunker_id, chunker) in chunkers {
+            let chunker_client = ChunkerClient::new(&chunker.service).await;
+            clients.insert(chunker_id.to_string(), chunker_client);
+        }
+    }
+
+    // Create detector clients
+    for (detector_id, detector) in &config.detectors {
+        match detector.r#type {
+            DetectorType::TextContents => {
+                clients.insert(
+                    detector_id.into(),
+                    TextContentsDetectorClient::new(
+                        &detector.service,
+                        detector.health_service.as_ref(),
+                    )
+                    .await,
+                );
+            }
+            DetectorType::TextGeneration => {
+                clients.insert(
+                    detector_id.into(),
+                    TextGenerationDetectorClient::new(
+                        &detector.service,
+                        detector.health_service.as_ref(),
+                    )
+                    .await,
+                );
+            }
+            DetectorType::TextChat => {
+                clients.insert(
+                    detector_id.into(),
+                    TextChatDetectorClient::new(
+                        &detector.service,
+                        detector.health_service.as_ref(),
+                    )
+                    .await,
+                );
+            }
+            DetectorType::TextContextDoc => {
+                clients.insert(
+                    detector_id.into(),
+                    TextContextDocDetectorClient::new(
+                        &detector.service,
+                        detector.health_service.as_ref(),
+                    )
+                    .await,
+                );
+            }
+        }
+    }
+    clients
 }
 
 #[derive(Debug, Clone)]
@@ -216,7 +263,7 @@ pub struct Chunk {
 
 #[derive(Debug)]
 pub struct ClassificationWithGenTask {
-    pub request_id: Uuid,
+    pub trace_id: TraceId,
     pub model_id: String,
     pub inputs: String,
     pub guardrails_config: GuardrailsConfig,
@@ -225,9 +272,9 @@ pub struct ClassificationWithGenTask {
 }
 
 impl ClassificationWithGenTask {
-    pub fn new(request_id: Uuid, request: GuardrailsHttpRequest, headers: HeaderMap) -> Self {
+    pub fn new(trace_id: TraceId, request: GuardrailsHttpRequest, headers: HeaderMap) -> Self {
         Self {
-            request_id,
+            trace_id,
             model_id: request.model_id,
             inputs: request.inputs,
             guardrails_config: request.guardrail_config.unwrap_or_default(),
@@ -240,8 +287,8 @@ impl ClassificationWithGenTask {
 /// Task for the /api/v2/text/detection/content endpoint
 #[derive(Debug)]
 pub struct GenerationWithDetectionTask {
-    /// Request unique identifier
-    pub request_id: Uuid,
+    /// Unique identifier of request trace
+    pub trace_id: TraceId,
 
     /// Model ID of the LLM
     pub model_id: String,
@@ -261,12 +308,12 @@ pub struct GenerationWithDetectionTask {
 
 impl GenerationWithDetectionTask {
     pub fn new(
-        request_id: Uuid,
+        trace_id: TraceId,
         request: GenerationWithDetectionHttpRequest,
         headers: HeaderMap,
     ) -> Self {
         Self {
-            request_id,
+            trace_id,
             model_id: request.model_id,
             prompt: request.prompt,
             detectors: request.detectors,
@@ -279,8 +326,8 @@ impl GenerationWithDetectionTask {
 /// Task for the /api/v2/text/detection/content endpoint
 #[derive(Debug)]
 pub struct TextContentDetectionTask {
-    /// Request unique identifier
-    pub request_id: Uuid,
+    /// Unique identifier of request trace
+    pub trace_id: TraceId,
 
     /// Content to run detection on
     pub content: String,
@@ -294,12 +341,12 @@ pub struct TextContentDetectionTask {
 
 impl TextContentDetectionTask {
     pub fn new(
-        request_id: Uuid,
+        trace_id: TraceId,
         request: TextContentDetectionHttpRequest,
         headers: HeaderMap,
     ) -> Self {
         Self {
-            request_id,
+            trace_id,
             content: request.content,
             detectors: request.detectors,
             headers,
@@ -310,8 +357,8 @@ impl TextContentDetectionTask {
 /// Task for the /api/v1/text/task/detection/context endpoint
 #[derive(Debug)]
 pub struct ContextDocsDetectionTask {
-    /// Request unique identifier
-    pub request_id: Uuid,
+    /// Unique identifier of request trace
+    pub trace_id: TraceId,
 
     /// Content to run detection on
     pub content: String,
@@ -330,9 +377,9 @@ pub struct ContextDocsDetectionTask {
 }
 
 impl ContextDocsDetectionTask {
-    pub fn new(request_id: Uuid, request: ContextDocsHttpRequest, headers: HeaderMap) -> Self {
+    pub fn new(trace_id: TraceId, request: ContextDocsHttpRequest, headers: HeaderMap) -> Self {
         Self {
-            request_id,
+            trace_id,
             content: request.content,
             context_type: request.context_type,
             context: request.context,
@@ -342,11 +389,38 @@ impl ContextDocsDetectionTask {
     }
 }
 
+/// Task for the /api/v2/text/detection/chat endpoint
+#[derive(Debug)]
+pub struct ChatDetectionTask {
+    /// Request unique identifier
+    pub trace_id: TraceId,
+
+    /// Detectors configuration
+    pub detectors: HashMap<String, DetectorParams>,
+
+    // Messages to run detection on
+    pub messages: Vec<clients::openai::Message>,
+
+    // Headermap
+    pub headers: HeaderMap,
+}
+
+impl ChatDetectionTask {
+    pub fn new(trace_id: TraceId, request: ChatDetectionHttpRequest, headers: HeaderMap) -> Self {
+        Self {
+            trace_id,
+            detectors: request.detectors,
+            messages: request.messages,
+            headers,
+        }
+    }
+}
+
 /// Task for the /api/v2/text/detection/generated endpoint
 #[derive(Debug)]
 pub struct DetectionOnGenerationTask {
-    /// Request unique identifier
-    pub request_id: Uuid,
+    /// Unique identifier of request trace
+    pub trace_id: TraceId,
 
     /// User prompt to be sent to the LLM
     pub prompt: String,
@@ -363,12 +437,12 @@ pub struct DetectionOnGenerationTask {
 
 impl DetectionOnGenerationTask {
     pub fn new(
-        request_id: Uuid,
+        trace_id: TraceId,
         request: DetectionOnGeneratedHttpRequest,
         headers: HeaderMap,
     ) -> Self {
         Self {
-            request_id,
+            trace_id,
             prompt: request.prompt,
             generated_text: request.generated_text,
             detectors: request.detectors,
@@ -380,7 +454,7 @@ impl DetectionOnGenerationTask {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct StreamingClassificationWithGenTask {
-    pub request_id: Uuid,
+    pub trace_id: TraceId,
     pub model_id: String,
     pub inputs: String,
     pub guardrails_config: GuardrailsConfig,
@@ -389,13 +463,33 @@ pub struct StreamingClassificationWithGenTask {
 }
 
 impl StreamingClassificationWithGenTask {
-    pub fn new(request_id: Uuid, request: GuardrailsHttpRequest, headers: HeaderMap) -> Self {
+    pub fn new(trace_id: TraceId, request: GuardrailsHttpRequest, headers: HeaderMap) -> Self {
         Self {
-            request_id,
+            trace_id,
             model_id: request.model_id,
             inputs: request.inputs,
             guardrails_config: request.guardrail_config.unwrap_or_default(),
             text_gen_parameters: request.text_gen_parameters,
+            headers,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ChatCompletionsDetectionTask {
+    /// Unique identifier of request trace
+    pub trace_id: TraceId,
+    /// Chat completion request
+    pub request: ChatCompletionsRequest,
+    // Headermap
+    pub headers: HeaderMap,
+}
+
+impl ChatCompletionsDetectionTask {
+    pub fn new(trace_id: TraceId, request: ChatCompletionsRequest, headers: HeaderMap) -> Self {
+        Self {
+            trace_id,
+            request,
             headers,
         }
     }

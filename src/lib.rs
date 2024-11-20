@@ -15,8 +15,9 @@
 
 */
 
-#![allow(clippy::iter_kv_map, clippy::enum_variant_names)]
+#![allow(clippy::iter_kv_map, clippy::enum_variant_names, async_fn_in_trait)]
 
+pub mod args;
 mod clients;
 pub mod config;
 pub mod health;
@@ -24,3 +25,4 @@ mod models;
 pub mod orchestrator;
 mod pb;
 pub mod server;
+pub mod tracing_utils;

@@ -40,22 +40,26 @@ use axum_extra::extract::WithRejection;
 use futures::{stream, Stream, StreamExt};
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use opentelemetry::trace::TraceContextExt;
 use rustls::{server::WebPkiClientVerifier, RootCertStore, ServerConfig};
 use tokio::{net::TcpListener, signal};
 use tokio_rustls::TlsAcceptor;
+use tokio_stream::wrappers::ReceiverStream;
+use tower_http::trace::TraceLayer;
 use tower_service::Service;
-use tracing::{debug, error, info, warn};
-use uuid::Uuid;
+use tracing::{debug, error, info, instrument, warn, Span};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use webpki::types::{CertificateDer, PrivateKeyDer};
 
 use crate::{
-    health::HealthCheckProbeParams,
-    models,
+    clients::openai::{ChatCompletionsRequest, ChatCompletionsResponse},
+    models::{self, InfoParams, InfoResponse},
     orchestrator::{
-        self, ClassificationWithGenTask, ContextDocsDetectionTask, DetectionOnGenerationTask,
-        GenerationWithDetectionTask, Orchestrator, StreamingClassificationWithGenTask,
-        TextContentDetectionTask,
+        self, ChatCompletionsDetectionTask, ChatDetectionTask, ClassificationWithGenTask,
+        ContextDocsDetectionTask, DetectionOnGenerationTask, GenerationWithDetectionTask,
+        Orchestrator, StreamingClassificationWithGenTask, TextContentDetectionTask,
     },
+    tracing_utils,
 };
 
 const API_PREFIX: &str = r#"/api/v1/task"#;
@@ -127,15 +131,23 @@ pub async fn run(
         // Configure mTLS if client CA is provided
         let client_auth = if tls_client_ca_cert_path.is_some() {
             info!("Configuring TLS trust certificate (mTLS) for incoming connections");
-            let client_certs = load_certs(tls_client_ca_cert_path.as_ref().unwrap());
+            let client_certs = load_certs(
+                tls_client_ca_cert_path
+                    .as_ref()
+                    .expect("error loading certs for mTLS"),
+            );
             let mut client_auth_certs = RootCertStore::empty();
             for client_cert in client_certs {
                 // Should be only one
-                client_auth_certs.add(client_cert).unwrap();
+                client_auth_certs
+                    .add(client_cert.clone())
+                    .unwrap_or_else(|e| {
+                        panic!("error adding client cert {:?}: {}", client_cert, e)
+                    });
             }
             WebPkiClientVerifier::builder(client_auth_certs.into())
                 .build()
-                .unwrap()
+                .unwrap_or_else(|e| panic!("error building client verifier: {}", e))
         } else {
             WebPkiClientVerifier::no_client_auth()
         };
@@ -150,7 +162,7 @@ pub async fn run(
     }
 
     // (2b) Add main guardrails server routes
-    let app = Router::new()
+    let mut router = Router::new()
         .route(
             &format!("{}/classification-with-text-generation", API_PREFIX),
             post(classification_with_gen),
@@ -171,14 +183,34 @@ pub async fn run(
             post(detection_content),
         )
         .route(
+            &format!("{}/detection/chat", TEXT_API_PREFIX),
+            post(detect_chat),
+        )
+        .route(
             &format!("{}/detection/context", TEXT_API_PREFIX),
             post(detect_context_documents),
         )
         .route(
             &format!("{}/detection/generated", TEXT_API_PREFIX),
             post(detect_generated),
-        )
-        .with_state(shared_state);
+        );
+
+    // If chat generation is configured, enable the chat completions detection endpoint.
+    if shared_state.orchestrator.config().chat_generation.is_some() {
+        info!("Enabling chat completions detection endpoint");
+        router = router.route(
+            "/api/v2/chat/completions-detection",
+            post(chat_completions_detection),
+        );
+    }
+
+    let app = router.with_state(shared_state).layer(
+        TraceLayer::new_for_http()
+            .make_span_with(tracing_utils::incoming_request_span)
+            .on_request(tracing_utils::on_incoming_request)
+            .on_response(tracing_utils::on_outgoing_response)
+            .on_eos(tracing_utils::on_outgoing_eos),
+    );
 
     // (2c) Generate main guardrails server handle based on whether TLS is needed
     let listener: TcpListener = TcpListener::bind(&http_addr)
@@ -294,29 +326,23 @@ async fn health() -> Result<impl IntoResponse, ()> {
 
 async fn info(
     State(state): State<Arc<ServerState>>,
-    Query(params): Query<HealthCheckProbeParams>,
-) -> Result<impl IntoResponse, Error> {
-    match state.orchestrator.clients_health(params.probe).await {
-        Ok(client_health_info) => Ok(client_health_info),
-        Err(error) => {
-            error!(
-                "Unexpected internal error while checking client health info: {:?}",
-                error
-            );
-            Err(error.into())
-        }
-    }
+    Query(params): Query<InfoParams>,
+) -> Result<Json<InfoResponse>, Error> {
+    let services = state.orchestrator.client_health(params.probe).await;
+    Ok(Json(InfoResponse { services }))
 }
 
+#[instrument(skip_all, fields(model_id = ?request.model_id))]
 async fn classification_with_gen(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
     WithRejection(Json(request), _): WithRejection<Json<models::GuardrailsHttpRequest>, Error>,
 ) -> Result<impl IntoResponse, Error> {
-    let request_id = Uuid::new_v4();
+    let trace_id = Span::current().context().span().span_context().trace_id();
+    info!(?trace_id, "handling request");
     request.validate()?;
     let headers = filter_headers(&state.orchestrator.config().passthrough_headers, headers);
-    let task = ClassificationWithGenTask::new(request_id, request, headers);
+    let task = ClassificationWithGenTask::new(trace_id, request, headers);
     match state
         .orchestrator
         .handle_classification_with_gen(task)
@@ -327,6 +353,7 @@ async fn classification_with_gen(
     }
 }
 
+#[instrument(skip_all, fields(model_id = ?request.model_id))]
 async fn generation_with_detection(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -335,10 +362,11 @@ async fn generation_with_detection(
         Error,
     >,
 ) -> Result<impl IntoResponse, Error> {
-    let request_id = Uuid::new_v4();
+    let trace_id = Span::current().context().span().span_context().trace_id();
+    info!(?trace_id, "handling request");
     request.validate()?;
     let headers = filter_headers(&state.orchestrator.config().passthrough_headers, headers);
-    let task = GenerationWithDetectionTask::new(request_id, request, headers);
+    let task = GenerationWithDetectionTask::new(trace_id, request, headers);
     match state
         .orchestrator
         .handle_generation_with_detection(task)
@@ -349,12 +377,14 @@ async fn generation_with_detection(
     }
 }
 
+#[instrument(skip_all, fields(model_id = ?request.model_id))]
 async fn stream_classification_with_gen(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
     WithRejection(Json(request), _): WithRejection<Json<models::GuardrailsHttpRequest>, Error>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let request_id = Uuid::new_v4();
+    let trace_id = Span::current().context().span().span_context().trace_id();
+    info!(?trace_id, "handling request");
     if let Err(error) = request.validate() {
         // Request validation failed, return stream with single error SSE event
         let error: Error = error.into();
@@ -367,7 +397,7 @@ async fn stream_classification_with_gen(
         );
     }
     let headers = filter_headers(&state.orchestrator.config().passthrough_headers, headers);
-    let task = StreamingClassificationWithGenTask::new(request_id, request, headers);
+    let task = StreamingClassificationWithGenTask::new(trace_id, request, headers);
     let response_stream = state
         .orchestrator
         .handle_streaming_classification_with_gen(task)
@@ -391,30 +421,34 @@ async fn stream_classification_with_gen(
     Sse::new(event_stream).keep_alive(KeepAlive::default())
 }
 
+#[instrument(skip_all)]
 async fn detection_content(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
     Json(request): Json<models::TextContentDetectionHttpRequest>,
 ) -> Result<impl IntoResponse, Error> {
-    let request_id = Uuid::new_v4();
+    let trace_id = Span::current().context().span().span_context().trace_id();
+    info!(?trace_id, "handling request");
     request.validate()?;
     let headers = filter_headers(&state.orchestrator.config().passthrough_headers, headers);
-    let task = TextContentDetectionTask::new(request_id, request, headers);
+    let task = TextContentDetectionTask::new(trace_id, request, headers);
     match state.orchestrator.handle_text_content_detection(task).await {
         Ok(response) => Ok(Json(response).into_response()),
         Err(error) => Err(error.into()),
     }
 }
 
+#[instrument(skip_all)]
 async fn detect_context_documents(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
     WithRejection(Json(request), _): WithRejection<Json<models::ContextDocsHttpRequest>, Error>,
 ) -> Result<impl IntoResponse, Error> {
-    let request_id = Uuid::new_v4();
+    let trace_id = Span::current().context().span().span_context().trace_id();
+    info!(?trace_id, "handling request");
     request.validate()?;
     let headers = filter_headers(&state.orchestrator.config().passthrough_headers, headers);
-    let task = ContextDocsDetectionTask::new(request_id, request, headers);
+    let task = ContextDocsDetectionTask::new(trace_id, request, headers);
     match state
         .orchestrator
         .handle_context_documents_detection(task)
@@ -425,6 +459,23 @@ async fn detect_context_documents(
     }
 }
 
+#[instrument(skip_all)]
+async fn detect_chat(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    WithRejection(Json(request), _): WithRejection<Json<models::ChatDetectionHttpRequest>, Error>,
+) -> Result<impl IntoResponse, Error> {
+    let trace_id = Span::current().context().span().span_context().trace_id();
+    request.validate_for_text()?;
+    let headers = filter_headers(&state.orchestrator.config().passthrough_headers, headers);
+    let task = ChatDetectionTask::new(trace_id, request, headers);
+    match state.orchestrator.handle_chat_detection(task).await {
+        Ok(response) => Ok(Json(response).into_response()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[instrument(skip_all)]
 async fn detect_generated(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -433,16 +484,44 @@ async fn detect_generated(
         Error,
     >,
 ) -> Result<impl IntoResponse, Error> {
-    let request_id = Uuid::new_v4();
+    let trace_id = Span::current().context().span().span_context().trace_id();
+    info!(?trace_id, "handling request");
     request.validate()?;
     let headers = filter_headers(&state.orchestrator.config().passthrough_headers, headers);
-    let task = DetectionOnGenerationTask::new(request_id, request, headers);
+    let task = DetectionOnGenerationTask::new(trace_id, request, headers);
     match state
         .orchestrator
         .handle_generated_text_detection(task)
         .await
     {
         Ok(response) => Ok(Json(response).into_response()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[instrument(skip_all)]
+async fn chat_completions_detection(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    WithRejection(Json(request), _): WithRejection<Json<ChatCompletionsRequest>, Error>,
+) -> Result<impl IntoResponse, Error> {
+    let trace_id = Span::current().context().span().span_context().trace_id();
+    info!(?trace_id, "handling request");
+    let headers = filter_headers(&state.orchestrator.config().passthrough_headers, headers);
+    let task = ChatCompletionsDetectionTask::new(trace_id, request, headers);
+    match state
+        .orchestrator
+        .handle_chat_completions_detection(task)
+        .await
+    {
+        Ok(response) => match response {
+            ChatCompletionsResponse::Unary(response) => Ok(Json(response).into_response()),
+            ChatCompletionsResponse::Streaming(response_rx) => {
+                let response_stream = ReceiverStream::new(response_rx);
+                let sse = Sse::new(response_stream).keep_alive(KeepAlive::default());
+                Ok(sse.into_response())
+            }
+        },
         Err(error) => Err(error.into()),
     }
 }
