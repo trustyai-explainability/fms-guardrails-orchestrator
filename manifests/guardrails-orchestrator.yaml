@@ -1,0 +1,170 @@
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: fms-orchestr8-config-nlp
+  labels:
+    app: fmstack-nlp
+    component: fms-orchestr8-nlp
+    deploy-name: fms-orchestr8-nlp
+data:
+  config.yaml: |
+    generation:
+      provider: tgis
+      service:
+          hostname: caikit-tgis-isvc-grpc-predictor-guardrails-orchestrator.apps.rosa.chrxu.8vf2.p3.openshiftapps.com
+          port: 443
+          # tls: caikit
+    detectors:
+      regex:
+        service:
+          hostname:  https://regex-detector-guardrails-orchestrator.apps.rosa.chrxu.8vf2.p3.openshiftapps.com/api/v1/text/contents
+          port: 443
+        chunker_id: whole_doc_chunker
+        default_threshold: 0.5
+      # tls:
+      # caikit:
+      #   cert_path: /tls/server/tls.crt
+      #   key_path: /tls/server/tls.key
+      #   client_ca_cert_path: /tls/server/ca.crt
+---
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: fms-orchestr8-nlp
+  annotations:
+    configmap.reloader.stakater.com/reload: 'fms-orchestr8-config'
+  labels:
+    app: fmstack-nlp
+    component: fms-orchestr8-nlp
+    deploy-name: fms-orchestr8-nlp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fmstack-nlp
+      component: fms-orchestr8-nlp
+      deploy-name: fms-orchestr8-nlp
+  template:
+    metadata:
+      labels:
+        app: fmstack-nlp
+        component: fms-orchestr8-nlp
+        deploy-name: fms-orchestr8-nlp
+    spec:
+      volumes:
+        - name: fms-orchestr8-config-nlp
+          configMap:
+            name: fms-orchestr8-config-nlp
+            defaultMode: 420
+        - name: server-tls
+          secret:
+            secretName: caikitstack-caikit-inf-tls
+            defaultMode: 256
+      containers:
+        - resources:
+            limits:
+              cpu: '1'
+              memory: 2Gi
+            requests:
+              cpu: '1'
+              memory: 2Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8034
+              scheme: HTTP
+            initialDelaySeconds: 5
+            timeoutSeconds: 1
+            periodSeconds: 20
+            successThreshold: 1
+            failureThreshold: 3
+          terminationMessagePath: /dev/termination-log
+          name: fms-orchestr8-nlp
+          command:
+            - /app/bin/fms-guardrails-orchestr8
+          env:
+            - name: ORCHESTRATOR_CONFIG
+              value: /config/config.yaml
+            - name: HTTP_PORT
+              value: '8033'
+            - name: START_UP_HEALTH_CHECK
+              value: 'false'
+          ## Mount certs to /tls/orch and uncomment to enable (m)TLS
+          # - name: TLS_KEY_PATH
+          #   value: /tls/orch/server.key
+          # - name: TLS_CERT_PATH
+          #   value: /tls/orch/server.crt
+          # - name: TLS_CLIENT_CA_CERT_PATH
+          #   value: /tls/orch/ca.crt
+            - name: RUST_BACKTRACE
+              value: full
+            - name: RUST_LOG
+              value: 'fms_guardrails_orchestr8=debug'
+          securityContext:
+            capabilities:
+              drop:
+                - ALL
+            privileged: false
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
+          ports:
+            - name: http
+              containerPort: 8033
+              protocol: TCP
+          imagePullPolicy: Always
+          volumeMounts:
+            - name: fms-orchestr8-config-nlp # This refers to the configmap below
+              readOnly: true
+              mountPath: /config/config.yaml
+              subPath: config.yaml
+            # - name: server-tls # This is for the caikit server for generation [may want to name this better]
+            #   readOnly: true
+            #   mountPath: /tls/server
+          terminationMessagePolicy: File
+          image: quay.io/csantiago/guardrails-orchestrator:latest
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: fms-orchestr8-nlp
+  labels:
+    app: fmstack-nlp
+    component: fms-orchestr8-nlp
+spec:
+  ipFamilies:
+    - IPv4
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8033
+      targetPort: 8033
+  internalTrafficPolicy: Cluster
+  type: ClusterIP
+  ipFamilyPolicy: SingleStack
+  sessionAffinity: None
+  selector:
+    app: fmstack-nlp
+    component: fms-orchestr8-nlp
+    deploy-name: fms-orchestr8-nlp
+---
+kind: Route
+apiVersion: route.openshift.io/v1
+metadata:
+  name: gr2-nlp
+  labels:
+    app: fmstack-nlp
+    component: fms-orchestr8-nlp
+spec:
+  to:
+    kind: Service
+    name: fms-orchestr8-nlp
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
